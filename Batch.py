@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-文件扩展名还原工具（支持通配符魔数、独立忽略文件、彩色输出）
-根据文件开头的魔数（magic bytes）自动修正或添加扩展名。
-魔数映射存储在 table.json，忽略模式存储在 ignore.json（可自定义）。
+文件扩展名还原工具（高性能版）
+根据文件开头的魔数自动修正扩展名。
+魔数映射表: table.json，忽略规则: ignore.json（均支持通配符）
 """
 
 import os
@@ -13,121 +13,138 @@ import json
 import re
 import argparse
 import fnmatch
+from collections import OrderedDict
+
+# ---------- 颜色控制 ----------
+COLORS = {
+    'red': '\033[91m',
+    'green': '\033[92m',
+    'reset': '\033[0m'
+}
+USE_COLOR = True  # 由 --no-color 控制
 
 
-# ANSI 颜色码
-COLOR_RED = '\033[91m'
-COLOR_GREEN = '\033[92m'
-COLOR_RESET = '\033[0m'
+def print_colored(text, color='reset'):
+    if USE_COLOR and color in COLORS:
+        print(f"{COLORS[color]}{text}{COLORS['reset']}")
+    else:
+        print(text)
 
 
-def print_colored(text, color=COLOR_RESET):
-    """以指定颜色打印文本（颜色码需包含 RESET）"""
-    print(f"{color}{text}{COLOR_RESET}")
+# ---------- 配置加载器 ----------
+class MagicLoader:
+    """魔数映射表加载器，支持通配符并预编译正则"""
+    def __init__(self, config_path):
+        self.config_path = config_path
+        self.patterns = []  # 元素: (raw_magic, ext, regex_or_none)
+        self._load()
 
+    def _compile_pattern(self, pattern):
+        """将包含 ? 和 * 的十六进制模式编译为正则对象"""
+        escaped = re.escape(pattern.upper())
+        escaped = escaped.replace('\\?', '[0-9A-F]')
+        escaped = escaped.replace('\*', '.*')  # 注意顺序
+        return re.compile('^' + escaped)
 
-def load_settings(config_path):
-    """加载 table.json，返回魔数模式列表（按长度降序）"""
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            settings = json.load(f)
-    except Exception as e:
-        print_colored(f"错误：无法加载配置文件 {config_path} - {e}", COLOR_RED)
-        sys.exit(1)
+    def _load(self):
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            print_colored(f"错误：无法加载魔数配置文件 {self.config_path} - {e}", 'red')
+            sys.exit(1)
 
-    patterns = []
-    for magic, ext in settings.items():
-        magic = magic.upper().strip()
-        ext = ext.lstrip('.')
-        if not magic:
-            continue
-        if '*' in magic or '?' in magic:
-            regex = compile_pattern(magic)
-            patterns.append((magic, ext, regex))
-        else:
-            patterns.append((magic, ext, None))
+        for magic, ext in data.items():
+            magic = magic.upper().strip()
+            ext = ext.lstrip('.')
+            if not magic:
+                continue
+            if '*' in magic or '?' in magic:
+                regex = self._compile_pattern(magic)
+                self.patterns.append((magic, ext, regex))
+            else:
+                self.patterns.append((magic, ext, None))
 
-    patterns.sort(key=lambda x: len(x[0]), reverse=True)
-    return patterns
+        # 按魔数长度降序排序（精确匹配优先）
+        self.patterns.sort(key=lambda x: len(x[0]), reverse=True)
 
-
-def compile_pattern(pattern):
-    """编译包含通配符 ? 和 * 的魔数模式为正则对象"""
-    escaped = re.escape(pattern)
-    escaped = escaped.replace('\\?', '[0-9A-F]')
-    escaped = escaped.replace('\\*', '.*')
-    return re.compile('^' + escaped, re.IGNORECASE)
-
-
-def load_ignore_patterns(ignore_path):
-    """加载 ignore.json，返回忽略模式列表（若文件不存在则返回空）"""
-    if not os.path.isfile(ignore_path):
-        print(f"提示：忽略配置文件 {ignore_path} 不存在，将不忽略任何文件。")
-        return []
-
-    try:
-        with open(ignore_path, 'r', encoding='utf-8') as f:
-            patterns = json.load(f)
-        if isinstance(patterns, list):
-            return patterns
-        else:
-            print_colored(f"错误：忽略配置文件 {ignore_path} 格式错误，应为 JSON 数组。", COLOR_RED)
-            return []
-    except Exception as e:
-        print_colored(f"错误：无法加载忽略配置文件 {ignore_path} - {e}", COLOR_RED)
-        return []
-
-
-def is_ignored(file_path, ignore_patterns, base_dir=''):
-    """判断文件或文件夹是否应被忽略"""
-    if not ignore_patterns:
-        return False
-
-    name = os.path.basename(file_path)
-    rel_path = os.path.relpath(file_path, base_dir) if base_dir else file_path
-    rel_path = rel_path.replace('\\', '/')
-
-    for pattern in ignore_patterns:
-        if fnmatch.fnmatch(name, pattern):
-            return True
-        if fnmatch.fnmatch(rel_path, pattern.replace('\\', '/')):
-            return True
-    return False
-
-
-def find_extension_by_magic(file_path, patterns, read_bytes):
-    """读取文件头并匹配魔数，返回扩展名或 None"""
-    if not patterns:
+    def match(self, header_hex):
+        """在头部十六进制字符串中匹配魔数，返回扩展名或 None"""
+        for magic, ext, regex in self.patterns:
+            if regex is not None:
+                if regex.match(header_hex):
+                    return ext
+            else:
+                if header_hex.startswith(magic):
+                    return ext
         return None
 
+
+class IgnoreLoader:
+    """忽略规则加载器，支持路径和文件名通配"""
+    def __init__(self, ignore_path):
+        self.ignore_path = ignore_path
+        self.patterns = []
+        self._load()
+
+    def _load(self):
+        if not os.path.isfile(self.ignore_path):
+            print(f"提示：忽略配置文件 {self.ignore_path} 不存在，不忽略任何文件。")
+            return
+        try:
+            with open(self.ignore_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("忽略配置必须为 JSON 数组")
+            self.patterns = data
+        except Exception as e:
+            print_colored(f"错误：忽略配置文件 {self.ignore_path} 加载失败 - {e}", 'red')
+            sys.exit(1)
+
+    def is_ignored(self, file_path, base_dir=''):
+        """判断文件或目录是否应被忽略"""
+        if not self.patterns:
+            return False
+
+        name = os.path.basename(file_path)
+        rel_path = os.path.relpath(file_path, base_dir) if base_dir else file_path
+        rel_path = rel_path.replace('\\', '/')
+
+        for pattern in self.patterns:
+            if fnmatch.fnmatch(name, pattern):
+                return True
+            if fnmatch.fnmatch(rel_path, pattern.replace('\\', '/')):
+                return True
+        return False
+
+
+# ---------- 核心处理 ----------
+def get_file_header(file_path, read_bytes):
+    """读取文件头部，返回十六进制字符串；若失败返回 None"""
     try:
         with open(file_path, 'rb') as f:
             header = f.read(read_bytes)
+        return header.hex().upper()
     except Exception:
         return None
 
-    header_hex = header.hex().upper()
 
-    for magic, ext, regex in patterns:
-        if regex is not None:
-            if regex.match(header_hex):
-                return ext
-        else:
-            if header_hex.startswith(magic):
-                return ext
-    return None
-
-
-def process_file(file_path, patterns, read_bytes, dry_run=False):
+def process_file(file_path, magic_loader, read_bytes, dry_run=False, verbose=False):
     """
-    处理单个文件，返回 (status, old_path, new_path, message)
-    status: 'success' | 'exists' | 'error' | 'preview'
+    处理单个文件，返回 (status, old, new, msg)
+    status: 'success' | 'exists' | 'preview' | 'error'
     """
     if not os.path.isfile(file_path):
         return 'error', file_path, None, "不是普通文件"
 
-    ext = find_extension_by_magic(file_path, patterns, read_bytes)
+    header_hex = get_file_header(file_path, read_bytes)
+    if header_hex is None:
+        return 'error', file_path, None, "无法读取文件头部"
+
+    ext = magic_loader.match(header_hex)
     if ext is None:
+        if verbose:
+            return 'error', file_path, None, f"未匹配魔数 (头: {header_hex[:20]}...)"
         return 'error', file_path, None, "未匹配到任何魔数"
 
     dirname = os.path.dirname(file_path)
@@ -149,92 +166,108 @@ def process_file(file_path, patterns, read_bytes, dry_run=False):
         return 'error', file_path, new_path, f"重命名失败: {e}"
 
 
-def collect_files(path, recursive, ignore_patterns):
-    """收集待处理的文件列表（应用忽略规则）"""
+def collect_files(root_path, recursive, ignore_loader):
+    """收集待处理文件列表，应用忽略规则"""
     files = []
     if recursive:
-        if not os.path.isdir(path):
-            print_colored(f"错误：递归模式要求路径为文件夹 - {path}", COLOR_RED)
+        if not os.path.isdir(root_path):
+            print_colored(f"错误：递归模式要求路径为文件夹 - {root_path}", 'red')
             sys.exit(1)
-        for root, dirs, dir_files in os.walk(path):
-            if is_ignored(root, ignore_patterns, path):
+        for root, dirs, dir_files in os.walk(root_path):
+            # 如果当前目录被忽略，跳过整个子树
+            if ignore_loader.is_ignored(root, root_path):
                 dirs[:] = []
                 continue
             for f in dir_files:
                 full = os.path.join(root, f)
-                if is_ignored(full, ignore_patterns, path):
-                    continue
-                files.append(full)
+                if not ignore_loader.is_ignored(full, root_path):
+                    files.append(full)
     else:
-        if not os.path.isfile(path):
-            print_colored(f"错误：非递归模式要求路径为文件 - {path}", COLOR_RED)
+        if not os.path.isfile(root_path):
+            print_colored(f"错误：非递归模式要求路径为文件 - {root_path}", 'red')
             sys.exit(1)
-        if not is_ignored(path, ignore_patterns, os.path.dirname(path)):
-            files.append(path)
+        if not ignore_loader.is_ignored(root_path, os.path.dirname(root_path)):
+            files.append(root_path)
     return files
 
 
+# ---------- 主程序 ----------
 def main():
     parser = argparse.ArgumentParser(
-        description="通过文件头部魔数还原文件扩展名（支持通配符魔数、独立忽略文件、彩色输出）"
+        description="根据文件头魔数还原扩展名（高性能版）",
+        epilog="配置文件: table.json (魔数映射), ignore.json (忽略规则)"
     )
     parser.add_argument('path', help='文件或文件夹路径（递归模式时为文件夹）')
     parser.add_argument('-c', '--config', default='table.json',
-                        help='魔数映射配置文件路径（默认：table.json）')
+                        help='魔数映射表路径 (默认: table.json)')
     parser.add_argument('-i', '--ignore-config', default='ignore.json',
-                        help='忽略模式配置文件路径（默认：ignore.json）')
+                        help='忽略规则路径 (默认: ignore.json)')
     parser.add_argument('-r', '--recursive', action='store_true',
-                        help='递归处理文件夹下的所有文件')
+                        help='递归处理子文件夹')
     parser.add_argument('-b', '--bytes', type=int, default=256,
-                        help='读取文件头部的字节数（默认 256）')
+                        help='读取头部字节数 (默认: 256)')
     parser.add_argument('--dry-run', action='store_true',
-                        help='仅显示匹配结果，不实际重命名')
+                        help='预览模式，不实际重命名')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='显示更多信息（如匹配的魔数头）')
+    parser.add_argument('--no-color', action='store_true',
+                        help='禁用彩色输出')
     args = parser.parse_args()
 
+    global USE_COLOR
+    if args.no_color:
+        USE_COLOR = False
+
+    # 检查路径和配置文件
     if not os.path.exists(args.path):
-        print_colored(f"错误：路径不存在 - {args.path}", COLOR_RED)
+        print_colored(f"错误：路径不存在 - {args.path}", 'red')
         sys.exit(1)
-
     if not os.path.isfile(args.config):
-        print_colored(f"错误：魔数配置文件不存在 - {args.config}", COLOR_RED)
+        print_colored(f"错误：魔数配置文件不存在 - {args.config}", 'red')
         sys.exit(1)
 
-    patterns = load_settings(args.config)
-    ignore_patterns = load_ignore_patterns(args.ignore_config)
+    # 加载配置
+    magic_loader = MagicLoader(args.config)
+    ignore_loader = IgnoreLoader(args.ignore_config)
 
-    files_to_process = collect_files(args.path, args.recursive, ignore_patterns)
-
-    if not files_to_process:
-        print("没有找到任何文件需要处理（或全部被忽略）。")
+    # 收集文件
+    file_list = collect_files(args.path, args.recursive, ignore_loader)
+    if not file_list:
+        print("没有找到任何需要处理的文件（或全部被忽略）。")
         return
 
-    total = len(files_to_process)
+    total = len(file_list)
     success_count = 0
-    for idx, file_path in enumerate(files_to_process, 1):
-        status, old, new, msg = process_file(file_path, patterns, args.bytes, args.dry_run)
+    status_color = {
+        'success': 'green',
+        'preview': 'reset',
+        'exists': 'reset',
+        'error': 'red'
+    }
 
-        # 根据状态选择颜色
+    for idx, fpath in enumerate(file_list, 1):
+        status, old, new, msg = process_file(fpath, magic_loader, args.bytes, args.dry_run, args.verbose)
         if status == 'success':
-            color = COLOR_GREEN
             success_count += 1
-        elif status == 'error':
-            color = COLOR_RED
-        else:  # 'exists' 或 'preview'
-            color = COLOR_RESET  # 默认颜色
 
-        # 构建输出信息
+        # 构建输出消息
+        if status == 'success':
+            label = "成功"
+        elif status == 'preview':
+            label = "预览"
+        elif status == 'exists':
+            label = "跳过"
+        else:
+            label = "跳过"
+
         if new is None:
-            output = f"[{idx}/{total}] 跳过: {old} - {msg}"
+            output = f"[{idx}/{total}] {label}: {old} - {msg}"
         else:
-            output = f"[{idx}/{total}] 跳过: {old} -> {new} - {msg}" if status != 'success' else f"[{idx}/{total}] 成功: {old} -> {new}"
+            output = f"[{idx}/{total}] {label}: {old} -> {new} - {msg}"
 
-        # 打印（若为默认颜色则直接 print，否则用彩色）
-        if color == COLOR_RESET:
-            print(output)
-        else:
-            print_colored(output, color)
+        print_colored(output, status_color.get(status, 'reset'))
 
-    # 最终总结
+    # 总结
     if args.dry_run:
         print(f"预览完成，共 {total} 个文件，其中 {success_count} 个将重命名。")
     else:
