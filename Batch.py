@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-文件扩展名还原工具（支持 OGG 流类型检测，使用独立模块）
-根据文件头魔数自动修正扩展名，OGG 文件会进一步解析内部流类型。
+文件扩展名还原工具（支持 OGG / MP4 容器流类型检测）
 固定配置文件: table.json (魔数映射), ignore.json (忽略规则)
 """
 
@@ -14,14 +13,21 @@ import re
 import argparse
 import fnmatch
 
-# 导入 OGG 检测模块
+# 导入容器检测模块（缺失时自动降级）
 try:
     from OGG import detect_ogg_type
 except ImportError:
     print("警告：未找到 ogg_detector.py，OGG 视频/音频区分功能不可用。")
-    # 定义一个空函数，避免崩溃
     def detect_ogg_type(file_path):
         return 'unknown'
+
+try:
+    from MP4 import detect_mp4_type
+except ImportError:
+    print("警告：未找到 mp4_detector.py，MP4 纯音频/视频区分功能不可用。")
+    def detect_mp4_type(file_path):
+        return 'unknown'
+
 
 # ---------- 颜色控制 ----------
 COLORS = {
@@ -123,8 +129,7 @@ class IgnoreLoader:
 def get_file_header(file_path, read_bytes):
     try:
         with open(file_path, 'rb') as f:
-            header = f.read(read_bytes)
-        return header.hex().upper()
+            return f.read(read_bytes).hex().upper()
     except Exception:
         return None
 
@@ -143,15 +148,22 @@ def process_file(file_path, magic_loader, read_bytes, dry_run=False, verbose=Fal
             return 'error', file_path, None, f"未匹配魔数 (头: {header_hex[:20]}...)"
         return 'error', file_path, None, "未匹配到任何魔数"
 
-    # ---- OGG 特殊处理（调用独立模块） ----
-    # 检查是否以 "4F6767" 开头（即 OGG 魔数）
+    # ---- OGG 特殊处理 ----
     if header_hex.startswith("4F6767"):
         ogg_type = detect_ogg_type(file_path)
         if ogg_type == 'video':
-            ext = 'ogv'   # 视频 OGG
+            ext = 'ogv'
         elif ogg_type == 'audio':
-            ext = 'ogg'   # 音频 OGG（保持默认）
-        # 其他情况保持原 ext
+            ext = 'ogg'
+
+    # ---- MP4 特殊处理 ----
+    # 头部前 64 个十六进制字符内出现 'ftyp'（66747970）即视为 MP4
+    elif '66747970' in header_hex[:64]:
+        mp4_type = detect_mp4_type(file_path)
+        if mp4_type == 'audio':
+            ext = 'm4a'   # 纯音频 MP4
+        elif mp4_type == 'video':
+            ext = 'mp4'   # 含视频
 
     dirname = os.path.dirname(file_path)
     basename = os.path.basename(file_path)
@@ -198,7 +210,7 @@ def collect_files(root_path, recursive, ignore_loader):
 # ---------- 主程序 ----------
 def main():
     parser = argparse.ArgumentParser(
-        description="根据文件头魔数还原扩展名（支持 OGG 流类型检测）",
+        description="根据文件头魔数还原扩展名（支持 OGG / MP4 流类型检测）",
         epilog="固定配置文件: table.json (魔数映射), ignore.json (忽略规则)"
     )
     parser.add_argument('path', help='文件或文件夹路径（递归模式时为文件夹）')
@@ -209,7 +221,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true',
                         help='预览模式，不实际重命名')
     parser.add_argument('-v', '--verbose', action='store_true',
-                        help='显示更多信息（如匹配的魔数头）')
+                        help='显示更多信息')
     parser.add_argument('--no-color', action='store_true',
                         help='禁用彩色输出')
     args = parser.parse_args()
@@ -247,18 +259,17 @@ def main():
     }
 
     for idx, fpath in enumerate(file_list, 1):
-        status, old, new, msg = process_file(fpath, magic_loader, args.bytes, args.dry_run, args.verbose)
+        status, old, new, msg = process_file(
+            fpath, magic_loader, args.bytes, args.dry_run, args.verbose
+        )
         if status == 'success':
             success_count += 1
 
-        if status == 'success':
-            label = "成功"
-        elif status == 'preview':
-            label = "预览"
-        elif status == 'exists':
-            label = "跳过"
-        else:
-            label = "跳过"
+        label = {
+            'success': '成功',
+            'preview': '预览',
+            'exists': '跳过',
+        }.get(status, '跳过')
 
         if new is None:
             output = f"[{idx}/{total}] {label}: {old} - {msg}"
