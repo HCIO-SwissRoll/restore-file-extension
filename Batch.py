@@ -2,286 +2,134 @@
 # -*- coding: utf-8 -*-
 
 """
-文件扩展名还原工具（支持 OGG / MP4 容器流类型检测）
-固定配置文件: table.json (魔数映射), ignore.json (忽略规则)
+文件扩展名还原工具（模块化 + 插件式容器检测）
+
+用法示例:
+    python Batch.py -r D:\Media
+    python Batch.py -r --dry-run -v D:\Media
+    python Batch.py --no-color D:\file.bin
 """
 
+import argparse
 import os
 import sys
-import json
-import re
-import argparse
-import fnmatch
 
-# 导入容器检测模块（缺失时自动降级）
-try:
-    from OGG import detect_ogg_type
-except ImportError:
-    print("警告：未找到 ogg_detector.py，OGG 视频/音频区分功能不可用。")
-    def detect_ogg_type(file_path):
-        return 'unknown'
-
-try:
-    from MP4 import detect_mp4_type
-except ImportError:
-    print("警告：未找到 mp4_detector.py，MP4 纯音频/视频区分功能不可用。")
-    def detect_mp4_type(file_path):
-        return 'unknown'
+from core.console import Console
+from core.config import MagicTable, IgnoreRules, ConfigError
+from core import registry
+from core.collector import collect_files
+from core.processor import process_file, Status
 
 
-# ---------- 颜色控制 ----------
-COLORS = {
-    'red': '\033[91m',
-    'green': '\033[92m',
-    'reset': '\033[0m'
-}
-USE_COLOR = True
+MAGIC_CONFIG = 'table.json'
+IGNORE_CONFIG = 'ignore.json'
 
 
-def print_colored(text, color='reset'):
-    if USE_COLOR and color in COLORS:
-        print(f"{COLORS[color]}{text}{COLORS['reset']}")
-    else:
-        print(text)
-
-
-# ---------- 配置加载器 ----------
-class MagicLoader:
-    """魔数映射表加载器，支持通配符并预编译正则"""
-    def __init__(self, config_path):
-        self.config_path = config_path
-        self.patterns = []
-        self._load()
-
-    def _compile_pattern(self, pattern):
-        escaped = re.escape(pattern.upper())
-        escaped = escaped.replace('\\?', '[0-9A-F]')
-        escaped = escaped.replace('\*', '.*')
-        return re.compile('^' + escaped)
-
-    def _load(self):
-        try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as e:
-            print_colored(f"错误：无法加载魔数配置文件 {self.config_path} - {e}", 'red')
-            sys.exit(1)
-
-        for magic, ext in data.items():
-            magic = magic.upper().strip()
-            ext = ext.lstrip('.')
-            if not magic:
-                continue
-            if '*' in magic or '?' in magic:
-                regex = self._compile_pattern(magic)
-                self.patterns.append((magic, ext, regex))
-            else:
-                self.patterns.append((magic, ext, None))
-
-        self.patterns.sort(key=lambda x: len(x[0]), reverse=True)
-
-    def match(self, header_hex):
-        for magic, ext, regex in self.patterns:
-            if regex is not None:
-                if regex.match(header_hex):
-                    return ext
-            else:
-                if header_hex.startswith(magic):
-                    return ext
-        return None
-
-
-class IgnoreLoader:
-    def __init__(self, ignore_path):
-        self.ignore_path = ignore_path
-        self.patterns = []
-        self._load()
-
-    def _load(self):
-        if not os.path.isfile(self.ignore_path):
-            print(f"提示：忽略配置文件 {self.ignore_path} 不存在，不忽略任何文件。")
-            return
-        try:
-            with open(self.ignore_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if not isinstance(data, list):
-                raise ValueError("忽略配置必须为 JSON 数组")
-            self.patterns = data
-        except Exception as e:
-            print_colored(f"错误：忽略配置文件 {self.ignore_path} 加载失败 - {e}", 'red')
-            sys.exit(1)
-
-    def is_ignored(self, file_path, base_dir=''):
-        if not self.patterns:
-            return False
-        name = os.path.basename(file_path)
-        rel_path = os.path.relpath(file_path, base_dir) if base_dir else file_path
-        rel_path = rel_path.replace('\\', '/')
-        for pattern in self.patterns:
-            if fnmatch.fnmatch(name, pattern):
-                return True
-            if fnmatch.fnmatch(rel_path, pattern.replace('\\', '/')):
-                return True
-        return False
-
-
-# ---------- 核心处理 ----------
-def get_file_header(file_path, read_bytes):
-    try:
-        with open(file_path, 'rb') as f:
-            return f.read(read_bytes).hex().upper()
-    except Exception:
-        return None
-
-
-def process_file(file_path, magic_loader, read_bytes, dry_run=False, verbose=False):
-    if not os.path.isfile(file_path):
-        return 'error', file_path, None, "不是普通文件"
-
-    header_hex = get_file_header(file_path, read_bytes)
-    if header_hex is None:
-        return 'error', file_path, None, "无法读取文件头部"
-
-    ext = magic_loader.match(header_hex)
-    if ext is None:
-        if verbose:
-            return 'error', file_path, None, f"未匹配魔数 (头: {header_hex[:20]}...)"
-        return 'error', file_path, None, "未匹配到任何魔数"
-
-    # ---- OGG 特殊处理 ----
-    if header_hex.startswith("4F6767"):
-        ogg_type = detect_ogg_type(file_path)
-        if ogg_type == 'video':
-            ext = 'ogv'
-        elif ogg_type == 'audio':
-            ext = 'ogg'
-
-    # ---- MP4 特殊处理 ----
-    # 头部前 64 个十六进制字符内出现 'ftyp'（66747970）即视为 MP4
-    elif '66747970' in header_hex[:64]:
-        mp4_type = detect_mp4_type(file_path)
-        if mp4_type == 'audio':
-            ext = 'm4a'   # 纯音频 MP4
-        elif mp4_type == 'video':
-            ext = 'mp4'   # 含视频
-
-    dirname = os.path.dirname(file_path)
-    basename = os.path.basename(file_path)
-    name, _ = os.path.splitext(basename)
-    new_name = f"{name}.{ext}"
-    new_path = os.path.join(dirname, new_name)
-
-    if dry_run:
-        return 'preview', file_path, new_path, "预览 (将重命名)"
-
-    if os.path.exists(new_path):
-        return 'exists', file_path, new_path, "目标文件已存在，跳过"
-
-    try:
-        os.rename(file_path, new_path)
-        return 'success', file_path, new_path, "成功"
-    except Exception as e:
-        return 'error', file_path, new_path, f"重命名失败: {e}"
-
-
-def collect_files(root_path, recursive, ignore_loader):
-    files = []
-    if recursive:
-        if not os.path.isdir(root_path):
-            print_colored(f"错误：递归模式要求路径为文件夹 - {root_path}", 'red')
-            sys.exit(1)
-        for root, dirs, dir_files in os.walk(root_path):
-            if ignore_loader.is_ignored(root, root_path):
-                dirs[:] = []
-                continue
-            for f in dir_files:
-                full = os.path.join(root, f)
-                if not ignore_loader.is_ignored(full, root_path):
-                    files.append(full)
-    else:
-        if not os.path.isfile(root_path):
-            print_colored(f"错误：非递归模式要求路径为文件 - {root_path}", 'red')
-            sys.exit(1)
-        if not ignore_loader.is_ignored(root_path, os.path.dirname(root_path)):
-            files.append(root_path)
-    return files
-
-
-# ---------- 主程序 ----------
-def main():
-    parser = argparse.ArgumentParser(
-        description="根据文件头魔数还原扩展名（支持 OGG / MP4 流类型检测）",
-        epilog="固定配置文件: table.json (魔数映射), ignore.json (忽略规则)"
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="根据文件头魔数还原扩展名（支持插件式容器检测）",
+        epilog=f"固定配置文件: {MAGIC_CONFIG}, {IGNORE_CONFIG}"
     )
-    parser.add_argument('path', help='文件或文件夹路径（递归模式时为文件夹）')
-    parser.add_argument('-r', '--recursive', action='store_true',
-                        help='递归处理子文件夹')
-    parser.add_argument('-b', '--bytes', type=int, default=256,
-                        help='读取头部字节数 (默认: 256)')
-    parser.add_argument('--dry-run', action='store_true',
-                        help='预览模式，不实际重命名')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='显示更多信息')
-    parser.add_argument('--no-color', action='store_true',
-                        help='禁用彩色输出')
-    args = parser.parse_args()
+    p.add_argument('path', help='文件或文件夹路径')
+    p.add_argument('-r', '--recursive', action='store_true',
+                   help='递归处理子文件夹')
+    p.add_argument('-b', '--bytes', type=int, default=256,
+                   help='读取文件头部的字节数（默认 256）')
+    p.add_argument('--dry-run', action='store_true',
+                   help='预览模式，不实际重命名')
+    p.add_argument('-v', '--verbose', action='store_true',
+                   help='显示更多信息')
+    p.add_argument('--no-color', action='store_true',
+                   help='禁用彩色输出')
+    return p.parse_args()
 
-    global USE_COLOR
-    if args.no_color:
-        USE_COLOR = False
+
+def load_configs(console):
+    """加载魔数表与忽略规则，返回 (magic_table, ignore_rules)"""
+    try:
+        magic_table = MagicTable(MAGIC_CONFIG)
+    except ConfigError as e:
+        console.error(f"错误: {e}")
+        sys.exit(1)
+
+    try:
+        ignore_rules = IgnoreRules(IGNORE_CONFIG)
+    except ConfigError as e:
+        console.warn(f"警告: {e}，将不忽略任何文件。")
+        ignore_rules = IgnoreRules.empty()
+
+    return magic_table, ignore_rules
+
+
+def main():
+    args = parse_args()
+    console = Console(use_color=not args.no_color)
 
     if not os.path.exists(args.path):
-        print_colored(f"错误：路径不存在 - {args.path}", 'red')
+        console.error(f"错误: 路径不存在 - {args.path}")
         sys.exit(1)
 
-    magic_config = 'table.json'
-    ignore_config = 'ignore.json'
+    # 1) 加载配置
+    magic_table, ignore_rules = load_configs(console)
 
-    if not os.path.isfile(magic_config):
-        print_colored(f"错误：魔数配置文件 {magic_config} 不存在", 'red')
+    # 2) 发现检测器插件
+    registry.discover(console=console if args.verbose else None)
+    if args.verbose:
+        names = [d.name for d in registry.list_all()]
+        console.info(f"共加载 {len(names)} 个检测器: {names}")
+
+    # 3) 收集文件
+    try:
+        files = collect_files(args.path, args.recursive, ignore_rules)
+    except ValueError as e:
+        console.error(f"错误: {e}")
         sys.exit(1)
 
-    magic_loader = MagicLoader(magic_config)
-    ignore_loader = IgnoreLoader(ignore_config)
-
-    file_list = collect_files(args.path, args.recursive, ignore_loader)
-    if not file_list:
-        print("没有找到任何需要处理的文件（或全部被忽略）。")
+    if not files:
+        console.info("没有需要处理的文件（或全部被忽略）。")
         return
 
-    total = len(file_list)
+    # 4) 逐个处理
+    total = len(files)
     success_count = 0
-    status_color = {
-        'success': 'green',
-        'preview': 'reset',
-        'exists': 'reset',
-        'error': 'red'
+
+    color_map = {
+        Status.SUCCESS: 'green',
+        Status.PREVIEW: 'reset',
+        Status.EXISTS:  'reset',
+        Status.ERROR:   'red',
+    }
+    label_map = {
+        Status.SUCCESS: '成功',
+        Status.PREVIEW: '预览',
+        Status.EXISTS:  '跳过',
+        Status.ERROR:   '跳过',
     }
 
-    for idx, fpath in enumerate(file_list, 1):
-        status, old, new, msg = process_file(
-            fpath, magic_loader, args.bytes, args.dry_run, args.verbose
+    for idx, fpath in enumerate(files, 1):
+        result = process_file(
+            fpath, magic_table, args.bytes,
+            refine_fn=registry.refine,
+            dry_run=args.dry_run,
         )
-        if status == 'success':
+        if result.status == Status.SUCCESS:
             success_count += 1
 
-        label = {
-            'success': '成功',
-            'preview': '预览',
-            'exists': '跳过',
-        }.get(status, '跳过')
-
-        if new is None:
-            output = f"[{idx}/{total}] {label}: {old} - {msg}"
+        label = label_map[result.status]
+        if result.new_path is None:
+            text = f"[{idx}/{total}] {label}: {result.old_path} - {result.message}"
         else:
-            output = f"[{idx}/{total}] {label}: {old} -> {new} - {msg}"
+            text = f"[{idx}/{total}] {label}: {result.old_path} -> {result.new_path}"
+            if result.message:
+                text += f" - {result.message}"
 
-        print_colored(output, status_color.get(status, 'reset'))
+        console.print(text, color_map[result.status])
 
+    # 5) 总结
     if args.dry_run:
-        print(f"预览完成，共 {total} 个文件，其中 {success_count} 个将重命名。")
+        console.info(f"预览完成，共 {total} 个文件，其中 {success_count} 个将重命名。")
     else:
-        print(f"处理完成，共 {total} 个文件，成功重命名 {success_count} 个。")
+        console.info(f"处理完成，共 {total} 个文件，成功重命名 {success_count} 个。")
 
 
 if __name__ == '__main__':
