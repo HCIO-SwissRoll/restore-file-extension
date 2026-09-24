@@ -8,6 +8,10 @@
     python restore_ext.py -r D:\Media
     python restore_ext.py -r --dry-run -v D:\Media
     python restore_ext.py -r --quiet --no-color D:\Media
+
+配置文件:
+    table.json  —— 魔数映射表（与脚本同目录 或 CWD，由 MagicTable 决定）
+    ignore.json —— 忽略规则，**仅从当前工作目录读取**
 """
 
 import argparse
@@ -22,13 +26,15 @@ from core.processor import process_file, Status
 
 
 MAGIC_CONFIG = 'table.json'
-IGNORE_CONFIG = 'ignore.json'
+
+# 忽略配置仅从当前工作目录读取
+IGNORE_CONFIG = os.path.abspath('ignore.json')
 
 
 def parse_args():
     p = argparse.ArgumentParser(
         description="根据文件头魔数还原扩展名（支持插件式容器检测与日志）",
-        epilog=f"固定配置文件: {MAGIC_CONFIG}, {IGNORE_CONFIG}"
+        epilog="固定配置文件: table.json (魔数表), ignore.json (工作区忽略规则)"
     )
     p.add_argument('path', help='文件或文件夹路径')
     p.add_argument('-r', '--recursive', action='store_true',
@@ -42,7 +48,6 @@ def parse_args():
     p.add_argument('--no-color', action='store_true',
                    help='禁用彩色输出')
 
-    # 日志相关
     p.add_argument('--no-log', action='store_true',
                    help='不写入日志文件（仅控制台）')
     p.add_argument('--quiet', action='store_true',
@@ -58,10 +63,16 @@ def load_configs(logger):
         logger.error(f"错误: {e}")
         sys.exit(1)
 
-    try:
-        ignore_rules = IgnoreRules(IGNORE_CONFIG)
-    except ConfigError as e:
-        logger.warn(f"警告: {e}，将不忽略任何文件。")
+    # 显式提示忽略规则的来源
+    if os.path.isfile(IGNORE_CONFIG):
+        logger.info(f"忽略规则来源: {IGNORE_CONFIG}")
+        try:
+            ignore_rules = IgnoreRules(IGNORE_CONFIG)
+        except ConfigError as e:
+            logger.warn(f"警告: {e}，将不忽略任何文件。")
+            ignore_rules = IgnoreRules.empty()
+    else:
+        logger.info(f"未找到工作区 ignore.json（{IGNORE_CONFIG}），将不忽略任何文件。")
         ignore_rules = IgnoreRules.empty()
 
     return magic_table, ignore_rules
@@ -89,10 +100,8 @@ def _run(args, logger):
         logger.error(f"错误: 路径不存在 - {args.path}")
         sys.exit(1)
 
-    # 1) 配置
     magic_table, ignore_rules = load_configs(logger)
 
-    # 2) 加载检测器插件
     if args.verbose:
         logger.info("正在加载检测器插件...")
     registry.discover(logger=logger if args.verbose else None)
@@ -100,7 +109,6 @@ def _run(args, logger):
         names = [d.name for d in registry.list_all()]
         logger.info(f"共加载 {len(names)} 个检测器: {names}")
 
-    # 3) 收集文件
     try:
         files = collect_files(args.path, args.recursive, ignore_rules)
     except ValueError as e:
@@ -111,7 +119,6 @@ def _run(args, logger):
         logger.info("没有需要处理的文件（或全部被忽略）。")
         return
 
-    # 4) 逐个处理
     total = len(files)
     success_count = 0
 
@@ -152,7 +159,6 @@ def _run(args, logger):
             'reset': 'info',
         }[color])(text)
 
-    # 5) 总结
     if args.dry_run:
         logger.info(f"预览完成，共 {total} 个文件，其中 {success_count} 个将重命名。")
     else:
