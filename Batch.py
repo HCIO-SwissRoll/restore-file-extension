@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-文件扩展名还原工具（模块化 + 插件式容器检测）
+文件扩展名还原工具（模块化 + 插件式容器检测 + 日志记录）
 
 用法示例:
     python Batch.py -r D:\Media
     python Batch.py -r --dry-run -v D:\Media
-    python Batch.py --no-color D:\file.bin
+    python Batch.py -r --log-file D:\logs\run.log D:\Media
+    python Batch.py -r --quiet --no-color D:\Media
 """
 
 import argparse
 import os
 import sys
 
-from core.console import Console
+from core.logger import Logger
 from core.config import MagicTable, IgnoreRules, ConfigError
 from core import registry
 from core.collector import collect_files
@@ -27,7 +28,7 @@ IGNORE_CONFIG = 'ignore.json'
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="根据文件头魔数还原扩展名（支持插件式容器检测）",
+        description="根据文件头魔数还原扩展名（支持插件式容器检测与日志）",
         epilog=f"固定配置文件: {MAGIC_CONFIG}, {IGNORE_CONFIG}"
     )
     p.add_argument('path', help='文件或文件夹路径')
@@ -41,21 +42,29 @@ def parse_args():
                    help='显示更多信息')
     p.add_argument('--no-color', action='store_true',
                    help='禁用彩色输出')
+
+    # 日志相关
+    p.add_argument('--log-file', metavar='PATH', default=None,
+                   help='日志文件路径（默认: restore_ext_<时间戳>.log）')
+    p.add_argument('--no-log', action='store_true',
+                   help='不写入日志文件（仅控制台）')
+    p.add_argument('--quiet', action='store_true',
+                   help='不输出到控制台（仅写日志文件）')
     return p.parse_args()
 
 
-def load_configs(console):
-    """加载魔数表与忽略规则，返回 (magic_table, ignore_rules)"""
+def load_configs(logger):
+    """加载魔数表与忽略规则"""
     try:
         magic_table = MagicTable(MAGIC_CONFIG)
     except ConfigError as e:
-        console.error(f"错误: {e}")
+        logger.error(f"错误: {e}")
         sys.exit(1)
 
     try:
         ignore_rules = IgnoreRules(IGNORE_CONFIG)
     except ConfigError as e:
-        console.warn(f"警告: {e}，将不忽略任何文件。")
+        logger.warn(f"警告: {e}，将不忽略任何文件。")
         ignore_rules = IgnoreRules.empty()
 
     return magic_table, ignore_rules
@@ -63,30 +72,47 @@ def load_configs(console):
 
 def main():
     args = parse_args()
-    console = Console(use_color=not args.no_color)
 
+    logger = Logger(
+        log_path=args.log_file,
+        use_color=not args.no_color,
+        quiet=args.quiet,
+        enable_file=not args.no_log,
+    )
+
+    try:
+        _run(args, logger)
+    finally:
+        if logger.log_path:
+            logger.info(f"日志已保存至: {logger.log_path}")
+        logger.close()
+
+
+def _run(args, logger):
     if not os.path.exists(args.path):
-        console.error(f"错误: 路径不存在 - {args.path}")
+        logger.error(f"错误: 路径不存在 - {args.path}")
         sys.exit(1)
 
-    # 1) 加载配置
-    magic_table, ignore_rules = load_configs(console)
+    # 1) 配置
+    magic_table, ignore_rules = load_configs(logger)
 
-    # 2) 发现检测器插件
-    registry.discover(console=console if args.verbose else None)
+    # 2) 加载检测器插件
+    if args.verbose:
+        logger.info("正在加载检测器插件...")
+    registry.discover(logger=logger if args.verbose else None)
     if args.verbose:
         names = [d.name for d in registry.list_all()]
-        console.info(f"共加载 {len(names)} 个检测器: {names}")
+        logger.info(f"共加载 {len(names)} 个检测器: {names}")
 
     # 3) 收集文件
     try:
         files = collect_files(args.path, args.recursive, ignore_rules)
     except ValueError as e:
-        console.error(f"错误: {e}")
+        logger.error(f"错误: {e}")
         sys.exit(1)
 
     if not files:
-        console.info("没有需要处理的文件（或全部被忽略）。")
+        logger.info("没有需要处理的文件（或全部被忽略）。")
         return
 
     # 4) 逐个处理
@@ -123,13 +149,19 @@ def main():
             if result.message:
                 text += f" - {result.message}"
 
-        console.print(text, color_map[result.status])
+        # 用对应的颜色方法写入（同时进日志文件和控制台）
+        color = color_map[result.status]
+        getattr(logger, {
+            'green': 'success',
+            'red':   'error',
+            'reset': 'info',
+        }[color])(text)
 
     # 5) 总结
     if args.dry_run:
-        console.info(f"预览完成，共 {total} 个文件，其中 {success_count} 个将重命名。")
+        logger.info(f"预览完成，共 {total} 个文件，其中 {success_count} 个将重命名。")
     else:
-        console.info(f"处理完成，共 {total} 个文件，成功重命名 {success_count} 个。")
+        logger.info(f"处理完成，共 {total} 个文件，成功重命名 {success_count} 个。")
 
 
 if __name__ == '__main__':
