@@ -5,10 +5,9 @@
 文件扩展名还原工具（模块化 + 插件式容器检测 + 日志记录）
 
 用法示例:
-    python Batch.py -r D:\Media
-    python Batch.py -r --dry-run -v D:\Media
-    python Batch.py -r --log-file D:\logs\run.log D:\Media
-    python Batch.py -r --quiet --no-color D:\Media
+    python restore_ext.py -r D:\Media
+    python restore_ext.py -r --dry-run -v D:\Media
+    python restore_ext.py -r --quiet --no-color D:\Media
 """
 
 import argparse
@@ -44,8 +43,6 @@ def parse_args():
                    help='禁用彩色输出')
 
     # 日志相关
-    p.add_argument('--log-file', metavar='PATH', default=None,
-                   help='日志文件路径（默认: restore_ext_<时间戳>.log）')
     p.add_argument('--no-log', action='store_true',
                    help='不写入日志文件（仅控制台）')
     p.add_argument('--quiet', action='store_true',
@@ -74,7 +71,6 @@ def main():
     args = parse_args()
 
     logger = Logger(
-        log_path=args.log_file,
         use_color=not args.no_color,
         quiet=args.quiet,
         enable_file=not args.no_log,
@@ -149,7 +145,6 @@ def _run(args, logger):
             if result.message:
                 text += f" - {result.message}"
 
-        # 用对应的颜色方法写入（同时进日志文件和控制台）
         color = color_map[result.status]
         getattr(logger, {
             'green': 'success',
