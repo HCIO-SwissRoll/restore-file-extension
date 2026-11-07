@@ -1,0 +1,12 @@
+[package]
+name = "restore-ext-py"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "restore_ext_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+restore-ext-core = { path = "../restore-ext-core", version = "0.1.0" }

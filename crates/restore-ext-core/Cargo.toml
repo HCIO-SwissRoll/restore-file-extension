@@ -1,0 +1,12 @@
+[package]
+name = "restore-ext-core"
+version = "0.1.0"
+edition = "2024"
+description = "File extension restoration from magic bytes, with OGG/MP4 stream detection"
+license = "GPL-3.0"
+repository = "https://https://github.com/HCIO-SwissRoll/restore-file-extension"
+keywords = ["magic-bytes", "file-type"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+regex = "1"
